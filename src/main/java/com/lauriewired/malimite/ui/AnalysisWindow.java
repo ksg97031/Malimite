@@ -933,9 +933,26 @@ public class AnalysisWindow {
             ZipEntry entry = zipIn.getNextEntry();
             DefaultMutableTreeNode appNode = null;
             
-            // First pass: Find and process Info.plist containing CFBundleIdentifier
+            // First pass: Find the MAIN app Info.plist (Payload/XXX.app/Info.plist, depth=3)
+            // Skip nested Info.plist files (WatchKit, Extensions, Frameworks, etc.)
             while (entry != null) {
-                if (entry.getName().endsWith("Info.plist")) {
+                String entryName = entry.getName();
+                if (entryName.endsWith("Info.plist")) {
+                    // Only consider top-level app Info.plist: Payload/XXX.app/Info.plist (3 segments)
+                    String[] segments = entryName.split("/");
+                    boolean isMainAppPlist = segments.length == 3
+                        && segments[0].equals("Payload")
+                        && segments[1].endsWith(".app")
+                        && segments[2].equals("Info.plist");
+
+                    if (!isMainAppPlist) {
+                        LOGGER.info("[PLIST-SCAN] Skipping nested Info.plist: " + entryName);
+                        zipIn.closeEntry();
+                        entry = zipIn.getNextEntry();
+                        continue;
+                    }
+
+                    LOGGER.info("[PLIST-SCAN] Found main app Info.plist: " + entryName);
                     // Read the content of the Info.plist file
                     ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
                     byte[] buffer = new byte[4096];
@@ -959,8 +976,9 @@ public class AnalysisWindow {
                         String nodePath = NodeOperations.buildFullPathFromNode(infoNode);
                         fileEntriesMap.put(nodePath, entry.getName());
                         infoPlist = new InfoPlist(infoNode, currentFilePath, fileEntriesMap);
+                        LOGGER.info("[PLIST-SCAN] Bundle executable: " + infoPlist.getExecutableName() + ", identifier: " + infoPlist.getBundleIdentifier());
                         updateBundleIdDisplay(infoPlist.getBundleIdentifier());
-                        
+
                         // Remove Info.plist from fileEntriesMap so it can be processed separately later
                         fileEntriesMap.remove(nodePath);
                         filesRootNode.remove(infoNode);
@@ -1107,19 +1125,47 @@ public class AnalysisWindow {
             @Override
             protected Void doInBackground() throws Exception {
                 publish("Extracting Mach-O file...");
-                projectDirectoryPath = FileProcessing.extractMachoToProjectDirectory(currentFilePath, 
+                LOGGER.info("[INIT] Extracting Mach-O from: " + currentFilePath);
+                LOGGER.info("[INIT] Bundle executable: " + infoPlist.getExecutableName());
+                long initStart = System.currentTimeMillis();
+                projectDirectoryPath = FileProcessing.extractMachoToProjectDirectory(currentFilePath,
                     infoPlist.getExecutableName(), config.getConfigDirectory());
-                LOGGER.info("Project directory created at: " + projectDirectoryPath);
+                LOGGER.info("[INIT] Project directory created at: " + projectDirectoryPath + " (" + (System.currentTimeMillis() - initStart) + "ms)");
 
                 publish("Opening project...");
-                FileProcessing.openProject(currentFilePath, projectDirectoryPath, 
+                FileProcessing.openProject(currentFilePath, projectDirectoryPath,
                     infoPlist.getExecutableName(), config.getConfigDirectory(), false);
+                LOGGER.info("[INIT] Project opened successfully");
 
                 executableFilePath = projectDirectoryPath + File.separator + infoPlist.getExecutableName();
-                LOGGER.info("Loading Mach-O file: " + executableFilePath);
-                
+                File execFile = new File(executableFilePath);
+                LOGGER.info("[INIT] Executable path: " + executableFilePath + " (exists=" + execFile.exists() + ", size=" + (execFile.exists() ? execFile.length() / 1024 / 1024 + "MB" : "N/A") + ")");
+
                 publish("Loading Mach-O file...");
+                initStart = System.currentTimeMillis();
                 projectMacho = new Macho(executableFilePath, projectDirectoryPath, infoPlist.getExecutableName());
+                LOGGER.info("[INIT] Macho loaded in " + (System.currentTimeMillis() - initStart) + "ms (universal=" + projectMacho.isUniversalBinary() + ", swift=" + projectMacho.isSwift() + ", encrypted=" + projectMacho.isEncrypted() + ")");
+
+                // Check for FairPlay DRM encryption and warn user
+                if (projectMacho.isEncrypted()) {
+                    LOGGER.warning("[ENCRYPT-WARN] Binary is FairPlay DRM encrypted - decompilation will be limited");
+                    publish("WARNING: FairPlay DRM encryption detected!");
+                    SwingUtilities.invokeAndWait(() -> {
+                        JOptionPane.showMessageDialog(analysisFrame,
+                            "<html><b>FairPlay DRM Encryption Detected</b><br><br>"
+                            + "This binary is encrypted with Apple FairPlay DRM.<br>"
+                            + "Decompilation results will be severely limited —<br>"
+                            + "most functions will show as <code>halt_baddata()</code> stubs.<br><br>"
+                            + "<b>Encryption details:</b><br>"
+                            + "• " + projectMacho.getEncryptionSummary() + "<br><br>"
+                            + "For full analysis, use a <b>decrypted IPA</b><br>"
+                            + "(e.g. from frida-ios-dump, bagbak, or Clutch).<br><br>"
+                            + "Analysis will continue with available data<br>"
+                            + "(strings, symbols, and unencrypted sections).</html>",
+                            "FairPlay DRM Warning",
+                            JOptionPane.WARNING_MESSAGE);
+                    });
+                }
 
                 // Get the input file name without extension
                 String inputFileName = new File(currentFilePath).getName();
@@ -1132,7 +1178,34 @@ public class AnalysisWindow {
                 LOGGER.info("Checking for database at: " + dbFilePath);
 
                 File dbFile = new File(dbFilePath);
-                if (!dbFile.exists()) {
+                // Check if DB exists AND has actual analysis data
+                boolean needsAnalysis = !dbFile.exists();
+                if (dbFile.exists()) {
+                    // DB file exists - check if it has data from a previous successful analysis
+                    SQLiteDBHandler checkDb = new SQLiteDBHandler(projectDirectoryPath + File.separator, inputFileName + "_malimite.db");
+                    if (!checkDb.hasAnalysisData()) {
+                        LOGGER.warning("[DB-CHECK] Database exists but is EMPTY (previous analysis likely failed). Deleting for re-analysis.");
+                        publish("Previous analysis incomplete - restarting...");
+                        // Close the check connection and delete the empty DB
+                        try { checkDb.GetTransaction().close(); } catch (Exception ex) { /* ignore */ }
+                        if (!dbFile.delete()) {
+                            LOGGER.severe("[DB-CHECK] Failed to delete empty database: " + dbFilePath);
+                        }
+                        // Also clean up stale lock files
+                        String ghidraProjectPrefix = infoPlist.getExecutableName() + "_malimite";
+                        for (String suffix : new String[]{".lock", ".lock~"}) {
+                            File lockFile = new File(projectDirectoryPath + File.separator + ghidraProjectPrefix + suffix);
+                            if (lockFile.exists()) {
+                                lockFile.delete();
+                                LOGGER.info("[DB-CHECK] Cleaned up stale lock file: " + lockFile.getName());
+                            }
+                        }
+                        needsAnalysis = true;
+                    } else {
+                        LOGGER.info("[DB-CHECK] Database has analysis data, loading existing results.");
+                    }
+                }
+                if (needsAnalysis) {
                     if (projectMacho.isUniversalBinary()) {
                         LOGGER.info("Detected universal binary - preparing to handle architecture selection");
                         final String[] selectedArch = new String[1];
@@ -1171,19 +1244,25 @@ public class AnalysisWindow {
                         inputFileName + "_malimite.db");
 
                     publish("Starting Ghidra analysis...");
-                    ghidraProject = new GhidraProject(infoPlist.getExecutableName(), 
-                        executableFilePath, config, dbHandler, 
+                    LOGGER.info("[GHIDRA] Ghidra path: " + config.getGhidraPath());
+                    LOGGER.info("[GHIDRA] Script path check: " + new File(System.getProperty("user.dir") + "/DecompilerBridge/ghidra/DumpClassData.java").exists());
+                    long ghidraStart = System.currentTimeMillis();
+                    ghidraProject = new GhidraProject(infoPlist.getExecutableName(),
+                        executableFilePath, config, dbHandler,
                         // Add console output callback
                         message -> SwingUtilities.invokeLater(() -> {
                             consoleOutput.append(message + "\n");
                             consoleOutput.setCaretPosition(consoleOutput.getDocument().getLength());
                         }));
-                
+
                     ghidraProject.decompileMacho(executableFilePath, projectDirectoryPath, projectMacho, false);
+                    LOGGER.info("[GHIDRA] Ghidra analysis completed in " + ((System.currentTimeMillis() - ghidraStart) / 1000) + " seconds");
                 } else {
                     publish("Loading existing database...");
-                    dbHandler = new SQLiteDBHandler(projectDirectoryPath + File.separator, 
+                    LOGGER.info("[DB] Loading existing database: " + dbFilePath + " (size=" + (dbFile.length() / 1024) + "KB)");
+                    dbHandler = new SQLiteDBHandler(projectDirectoryPath + File.separator,
                         inputFileName + "_malimite.db");
+                    LOGGER.info("[DB] Database loaded successfully");
                 }
 
                 // After dbHandler is initialized, set it in ResourceParser
@@ -1241,7 +1320,15 @@ public class AnalysisWindow {
 
     private static String selectArchitecture(List<String> architectures) {
         JComboBox<String> architectureComboBox = new JComboBox<>(architectures.toArray(new String[0]));
-        int result = JOptionPane.showConfirmDialog(null, architectureComboBox, "Select Architecture", 
+        // Default to ARM64 if available
+        for (int i = 0; i < architectures.size(); i++) {
+            if (architectures.get(i).contains("ARM64")) {
+                architectureComboBox.setSelectedIndex(i);
+                LOGGER.info("[ARM64-DEFAULT] Auto-selected ARM64 at index " + i);
+                break;
+            }
+        }
+        int result = JOptionPane.showConfirmDialog(null, architectureComboBox, "Select Architecture",
                                                     JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
         if (result == JOptionPane.OK_OPTION) {
             return (String) architectureComboBox.getSelectedItem();
@@ -1270,11 +1357,12 @@ public class AnalysisWindow {
             appNode.add(currentNode);
             fileEntriesMap.put(NodeOperations.buildFullPathFromNode(currentNode), entry.getName());
 
-            // Process Info.plist content
-            if (contentBytes != null) {
-                // Process as Info.plist
+            // Only set infoPlist if not already set (first pass already found the main app plist)
+            if (infoPlist == null && contentBytes != null) {
                 infoPlist = new InfoPlist(currentNode, currentFilePath, fileEntriesMap);
                 updateBundleIdDisplay(infoPlist.getBundleIdentifier());
+            } else {
+                LOGGER.info("[PLIST-SKIP] Not overwriting main infoPlist (current=" + infoPlist.getExecutableName() + ") with: " + entry.getName());
             }
         } else {
             // Create or get the "Resources" node and add other files to it

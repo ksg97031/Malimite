@@ -132,10 +132,19 @@ public class GhidraProject {
                 
                 // Close the initial heartbeat connection
                 socket.close();
-                
+
                 // Accept the new connection for actual data transfer
-                socket = serverSocket.accept();
+                // Set 10-minute timeout to detect Ghidra crashes during analysis
+                finalServerSocket.setSoTimeout(600000);
+                LOGGER.info("[SOCKET] Waiting for Ghidra data connection (timeout=10min)...");
+                try {
+                    socket = finalServerSocket.accept();
+                } catch (java.net.SocketTimeoutException ste) {
+                    LOGGER.severe("[SOCKET] Timed out waiting for Ghidra data connection after 10 minutes - Ghidra may have crashed");
+                    throw new RuntimeException("Ghidra script did not connect for data transfer within 10 minutes. Check Ghidra logs above.", ste);
+                }
                 socket.setSoTimeout(0); // No timeout for data transfer
+                LOGGER.info("[SOCKET] Ghidra data connection established");
             }
 
             // Start new try-with-resources for data transfer
@@ -147,37 +156,90 @@ public class GhidraProject {
                 }
                 LOGGER.info("Ghidra script confirmed connection, beginning analysis");
 
-                LOGGER.info("Reading class data from Ghidra script");
+                LOGGER.info("[SOCKET] Reading class data from Ghidra script...");
+                long readStart = System.currentTimeMillis();
                 String line;
                 StringBuilder classDataBuilder = new StringBuilder();
-                while (!(line = in.readLine()).equals("END_CLASS_DATA")) {
+                while ((line = in.readLine()) != null && !line.equals("END_CLASS_DATA")) {
                     classDataBuilder.append(line).append("\n");
                 }
+                if (line == null) {
+                    LOGGER.severe("[SOCKET] Connection lost while reading class data (received " + classDataBuilder.length() + " chars)");
+                    throw new RuntimeException("Ghidra script disconnected during class data transfer");
+                }
+                LOGGER.info("[SOCKET] Class data received: " + classDataBuilder.length() + " chars in " + (System.currentTimeMillis() - readStart) + "ms");
 
-                LOGGER.info("Reading Mach-O data from Ghidra script");
+                readStart = System.currentTimeMillis();
+                LOGGER.info("[SOCKET] Reading Mach-O data...");
                 StringBuilder machoDataBuilder = new StringBuilder();
-                while (!(line = in.readLine()).equals("END_MACHO_DATA")) {
+                while ((line = in.readLine()) != null && !line.equals("END_MACHO_DATA")) {
                     machoDataBuilder.append(line).append("\n");
                 }
-
-                LOGGER.info("Reading function decompilation data from Ghidra script");
-                StringBuilder functionDataBuilder = new StringBuilder();
-                while (!(line = in.readLine()).equals("END_DATA")) {
-                    functionDataBuilder.append(line).append("\n");
+                if (line == null) {
+                    LOGGER.severe("[SOCKET] Connection lost while reading Macho data");
+                    throw new RuntimeException("Ghidra script disconnected during Macho data transfer");
                 }
+                LOGGER.info("[SOCKET] Macho data received: " + machoDataBuilder.length() + " chars in " + (System.currentTimeMillis() - readStart) + "ms");
 
-                // Add this new section to process strings
-                LOGGER.info("Reading string data from Ghidra script");
+                readStart = System.currentTimeMillis();
+                LOGGER.info("[SOCKET] Reading function decompilation data (this may take a while for large binaries)...");
+                StringBuilder functionDataBuilder = new StringBuilder();
+                int functionLineCount = 0;
+                while ((line = in.readLine()) != null && !line.equals("END_DATA")) {
+                    functionDataBuilder.append(line).append("\n");
+                    functionLineCount++;
+                    if (functionLineCount % 10000 == 0) {
+                        LOGGER.info("[SOCKET] ... received " + functionLineCount + " lines of function data so far (" + (functionDataBuilder.length() / 1024) + " KB)");
+                    }
+                }
+                if (line == null) {
+                    LOGGER.severe("[SOCKET] Connection lost while reading function data after " + functionLineCount + " lines");
+                    throw new RuntimeException("Ghidra script disconnected during function data transfer");
+                }
+                LOGGER.info("[SOCKET] Function data received: " + functionDataBuilder.length() + " chars, " + functionLineCount + " lines in " + (System.currentTimeMillis() - readStart) + "ms");
+
+                readStart = System.currentTimeMillis();
+                LOGGER.info("[SOCKET] Reading string data...");
                 StringBuilder stringDataBuilder = new StringBuilder();
-                while (!(line = in.readLine()).equals("END_STRING_DATA")) {
+                while ((line = in.readLine()) != null && !line.equals("END_STRING_DATA")) {
                     stringDataBuilder.append(line).append("\n");
                 }
+                if (line == null) {
+                    LOGGER.severe("[SOCKET] Connection lost while reading string data");
+                    throw new RuntimeException("Ghidra script disconnected during string data transfer");
+                }
+                LOGGER.info("[SOCKET] String data received: " + stringDataBuilder.length() + " chars in " + (System.currentTimeMillis() - readStart) + "ms");
 
                 // Process and store the received data
-                JSONArray classData = new JSONArray(classDataBuilder.toString());
-                JSONArray functionData = new JSONArray(functionDataBuilder.toString());
-                JSONArray stringData = new JSONArray(stringDataBuilder.toString());
-                LOGGER.info("Processing " + classData.length() + " classes and " + functionData.length() + " functions from Ghidra analysis");
+                LOGGER.info("[PARSE] Parsing JSON data...");
+                long parseStart = System.currentTimeMillis();
+                JSONArray classData;
+                JSONArray functionData;
+                JSONArray stringData;
+                try {
+                    classData = new JSONArray(classDataBuilder.toString());
+                    LOGGER.info("[PARSE] Class data parsed: " + classData.length() + " entries");
+                } catch (Exception e) {
+                    LOGGER.severe("[PARSE] Failed to parse class data JSON (" + classDataBuilder.length() + " chars): " + e.getMessage());
+                    LOGGER.severe("[PARSE] First 500 chars: " + classDataBuilder.substring(0, Math.min(500, classDataBuilder.length())));
+                    throw e;
+                }
+                try {
+                    functionData = new JSONArray(functionDataBuilder.toString());
+                    LOGGER.info("[PARSE] Function data parsed: " + functionData.length() + " entries");
+                } catch (Exception e) {
+                    LOGGER.severe("[PARSE] Failed to parse function data JSON (" + functionDataBuilder.length() + " chars): " + e.getMessage());
+                    LOGGER.severe("[PARSE] First 500 chars: " + functionDataBuilder.substring(0, Math.min(500, functionDataBuilder.length())));
+                    throw e;
+                }
+                try {
+                    stringData = new JSONArray(stringDataBuilder.toString());
+                    LOGGER.info("[PARSE] String data parsed: " + stringData.length() + " entries");
+                } catch (Exception e) {
+                    LOGGER.severe("[PARSE] Failed to parse string data JSON (" + stringDataBuilder.length() + " chars): " + e.getMessage());
+                    throw e;
+                }
+                LOGGER.info("[PARSE] All JSON parsed in " + (System.currentTimeMillis() - parseStart) + "ms: " + classData.length() + " classes, " + functionData.length() + " functions, " + stringData.length() + " strings");
                 
                 // Process both class and function data together
                 Map<String, JSONArray> classToFunctions = new HashMap<>();
@@ -305,7 +367,7 @@ public class GhidraProject {
                 }
 
                 // Process string data
-                LOGGER.info("Processing " + stringData.length() + " strings from Ghidra analysis");
+                LOGGER.info("[DB] Processing " + stringData.length() + " strings from Ghidra analysis");
 
                 for (int i = 0; i < stringData.length(); i++) {
                     JSONObject stringObj = stringData.getJSONObject(i);
@@ -313,11 +375,26 @@ public class GhidraProject {
                     String value = stringObj.getString("value");
                     String segment = stringObj.getString("segment");
                     String label = stringObj.getString("label");
-                    LOGGER.info("Inserting string: " + value + " at address: " + address);
+                    if (i < 5 || i % 1000 == 0) {
+                        LOGGER.info("[DB] Inserting string [" + i + "/" + stringData.length() + "]: " + value);
+                    }
                     dbHandler.insertMachoString(address, value, segment, label, targetMacho.getMachoExecutableName());
                 }
 
-                LOGGER.info("Finished processing all data");
+                // Final verification
+                LOGGER.info("=== ANALYSIS SUMMARY ===");
+                LOGGER.info("[RESULT] Classes stored: " + classToFunctions.size());
+                LOGGER.info("[RESULT] Functions decompiled: " + decompilationResults.size());
+                LOGGER.info("[RESULT] Strings extracted: " + stringData.length());
+                LOGGER.info("[RESULT] Type info entries: " + typeInfoResults.size());
+                LOGGER.info("[RESULT] Function references: " + functionRefResults.size());
+                LOGGER.info("[RESULT] Variable references: " + varRefs.size());
+                boolean hasData = dbHandler.hasAnalysisData();
+                LOGGER.info("[RESULT] DB verification - hasAnalysisData: " + hasData);
+                if (!hasData) {
+                    LOGGER.severe("[RESULT] WARNING: Analysis completed but DB appears empty! Data may not have been committed.");
+                }
+                LOGGER.info("=== END ANALYSIS SUMMARY ===");
             }
 
             process.waitFor();

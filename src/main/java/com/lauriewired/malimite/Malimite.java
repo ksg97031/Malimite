@@ -3,6 +3,7 @@ package com.lauriewired.malimite;
 import com.formdev.flatlaf.FlatLightLaf;
 import com.formdev.flatlaf.FlatDarkLaf;
 import com.formdev.flatlaf.FlatLaf;
+import com.lauriewired.malimite.analysis.HeadlessAnalyzer;
 import com.lauriewired.malimite.configuration.Config;
 import com.lauriewired.malimite.ui.AnalysisWindow;
 import com.lauriewired.malimite.ui.SyntaxHighlighter;
@@ -32,16 +33,79 @@ public class Malimite {
     private static final Logger LOGGER = Logger.getLogger(Malimite.class.getName());
 
     public static void main(String[] args) {
+        // Parse CLI flags
+        String filePath = null;
+        String outputDir = null;
+        boolean headless = false;
+
+        for (int i = 0; i < args.length; i++) {
+            switch (args[i]) {
+                case "--headless":
+                    headless = true;
+                    break;
+                case "--output":
+                case "-o":
+                    if (i + 1 < args.length) {
+                        outputDir = args[++i];
+                    } else {
+                        System.err.println("Error: --output requires a directory path");
+                        System.exit(1);
+                    }
+                    break;
+                case "--help":
+                case "-h":
+                    printUsage();
+                    System.exit(0);
+                    break;
+                default:
+                    if (!args[i].startsWith("-")) {
+                        filePath = args[i];
+                    } else {
+                        System.err.println("Unknown option: " + args[i]);
+                        printUsage();
+                        System.exit(1);
+                    }
+                    break;
+            }
+        }
+
         // Load or create config immediately
         Config config = new Config();
-        
+
+        // Headless mode - no GUI
+        if (headless) {
+            if (filePath == null) {
+                System.err.println("Error: --headless requires an input file path");
+                printUsage();
+                System.exit(1);
+            }
+            if (outputDir == null) {
+                // Default output dir: <filename>_malimite_output/ next to input file
+                String baseName = new File(filePath).getName();
+                int dot = baseName.lastIndexOf('.');
+                if (dot > 0) baseName = baseName.substring(0, dot);
+                outputDir = new File(filePath).getParent() + File.separator + baseName + "_analysis";
+            }
+
+            try {
+                HeadlessAnalyzer analyzer = new HeadlessAnalyzer(config, filePath, outputDir);
+                analyzer.run();
+            } catch (Exception e) {
+                LOGGER.severe("[HEADLESS] Analysis failed: " + e.getMessage());
+                e.printStackTrace();
+                System.exit(1);
+            }
+            return;
+        }
+
+        // GUI mode below
         // Enable macOS-specific properties if on Mac
         if (config.isMac()) {
             System.setProperty("apple.laf.useScreenMenuBar", "true");
             System.setProperty("apple.awt.application.appearance", "system");
             System.setProperty("apple.awt.application.name", "Malimite");
         }
-        
+
         // Set initial FlatLaf theme based on config
         if (config.getTheme().equals("dark")) {
             FlatDarkLaf.setup();
@@ -50,8 +114,40 @@ public class Malimite {
         }
 
         FlatLaf.setUseNativeWindowDecorations(true);
-    
+
+        // If a file path is provided as CLI argument, auto-analyze it (GUI mode)
+        if (filePath != null) {
+            File inputFile = new File(filePath);
+            if (inputFile.exists()) {
+                LOGGER.info("[CLI] Auto-analyzing file: " + inputFile.getAbsolutePath());
+                FileProcessing.setConfig(config);
+                SwingUtilities.invokeLater(() -> {
+                    AnalysisWindow.show(inputFile, config);
+                });
+                return;
+            } else {
+                LOGGER.severe("[CLI] File not found: " + filePath);
+            }
+        }
+
         SwingUtilities.invokeLater(() -> createAndShowGUI(config));
+    }
+
+    private static void printUsage() {
+        System.out.println("Malimite - iOS/macOS Binary Analyzer");
+        System.out.println();
+        System.out.println("Usage:");
+        System.out.println("  malimite [options] <file.ipa|file.macho>");
+        System.out.println();
+        System.out.println("Options:");
+        System.out.println("  --headless       Run without GUI, produce JSON output");
+        System.out.println("  --output, -o     Output directory (default: <name>_analysis/)");
+        System.out.println("  --help, -h       Show this help message");
+        System.out.println();
+        System.out.println("Examples:");
+        System.out.println("  malimite app.ipa                          # GUI mode");
+        System.out.println("  malimite app.ipa --headless               # Headless, default output dir");
+        System.out.println("  malimite app.ipa --headless -o ./results  # Headless, custom output dir");
     }
 
     private static void createAndShowGUI(Config config) {
@@ -252,7 +348,7 @@ public class Malimite {
 
     private static void setupFileButtonListener(JButton fileButton, JTextField filePathText) {
         fileButton.addActionListener(e -> {
-            JFileChooser fileChooser = new JFileChooser();
+            JFileChooser fileChooser = new JFileChooser(System.getProperty("user.dir"));
             fileChooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
             int option = fileChooser.showOpenDialog(null);
             if (option == JFileChooser.APPROVE_OPTION) {

@@ -72,6 +72,9 @@ public class Config {
     }
 
     public String getGhidraPath() {
+        if (ghidraPath != null && ghidraPath.startsWith("~")) {
+            return System.getProperty("user.home") + ghidraPath.substring(1);
+        }
         return ghidraPath;
     }
 

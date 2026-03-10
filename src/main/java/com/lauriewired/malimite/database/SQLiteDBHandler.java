@@ -232,9 +232,26 @@ public class SQLiteDBHandler {
             pstmt.setString(2, functions);
             pstmt.setString(3, executableName);
             pstmt.executeUpdate();
+            this.transaction.commit();
         } catch (SQLException e) {
-            LOGGER.log(Level.SEVERE, "Error inserting class", e);
+            LOGGER.log(Level.SEVERE, "Error inserting class: " + className, e);
         }
+    }
+
+    /**
+     * Check if the database has any meaningful analysis data.
+     * Returns true if there are classes or functions stored.
+     */
+    public boolean hasAnalysisData() {
+        try (Statement stmt = this.transaction.createStatement()) {
+            ResultSet rs = stmt.executeQuery("SELECT COUNT(*) FROM Classes");
+            if (rs.next() && rs.getInt(1) > 0) return true;
+            rs = stmt.executeQuery("SELECT COUNT(*) FROM Functions");
+            if (rs.next() && rs.getInt(1) > 0) return true;
+        } catch (SQLException e) {
+            LOGGER.log(Level.WARNING, "Error checking analysis data", e);
+        }
+        return false;
     }
 
     public void readClasses() {
@@ -523,6 +540,8 @@ public class SQLiteDBHandler {
                 pstmt.addBatch();
             }
             pstmt.executeBatch();
+            this.transaction.commit();
+            LOGGER.info("[DB] Committed " + refs.size() + " local variable references");
         } catch (SQLException e) {
             LOGGER.log(Level.SEVERE, "Error inserting local variable references", e);
         }

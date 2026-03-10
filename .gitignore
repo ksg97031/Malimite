@@ -51,3 +51,10 @@ hs_err_pid*.log
 # Ignore local configuration file
 malimite.properties
 malimite.projects
+
+# IPA/binary files and analysis output
+*.ipa
+*.macho
+*_malimite/
+*_analysis/
+dependency-reduced-pom.xml

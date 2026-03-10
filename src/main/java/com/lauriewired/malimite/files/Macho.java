@@ -28,6 +28,19 @@ public class Macho {
     private String outputDirectoryPath;
     private String machoExecutableName;
     private boolean isSwift = false;
+    private boolean isEncrypted = false;
+    private int cryptoff = 0;
+    private int cryptsize = 0;
+
+    // Mach-O single-arch magic numbers
+    private static final int MH_MAGIC    = 0xFEEDFACE;
+    private static final int MH_CIGAM    = 0xCEFAEDFE;
+    private static final int MH_MAGIC_64 = 0xFEEDFACF;
+    private static final int MH_CIGAM_64 = 0xCFFAEDFE;
+
+    // Load command types for encryption info
+    private static final int LC_ENCRYPTION_INFO    = 0x21;
+    private static final int LC_ENCRYPTION_INFO_64 = 0x2C;
 
     public Macho(String machoExecutablePath, String outputDirectoryPath, String machoExecutableName) {
         this.isUniversal = false;
@@ -112,15 +125,17 @@ public class Macho {
      */
     private void processMacho() {
         File file = new File(this.machoExecutablePath);
+        LOGGER.info("[MACHO] Processing: " + file.getAbsolutePath() + " (size=" + (file.length() / 1024 / 1024) + "MB)");
 
         try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
             int magic = raf.readInt();
+            LOGGER.info("[MACHO] Magic number: 0x" + Integer.toHexString(magic));
             if (magic == UNIVERSAL_MAGIC || magic == UNIVERSAL_CIGAM) {
                 this.isUniversal = true;
-                LOGGER.info("Detected Universal binary with architectures:");
 
                 boolean reverseByteOrder = (magic == UNIVERSAL_CIGAM);
                 int archCount = reverseByteOrder ? Integer.reverseBytes(raf.readInt()) : raf.readInt();
+                LOGGER.info("[MACHO] Universal binary with " + archCount + " architectures (reversed=" + reverseByteOrder + ")");
                 for (int i = 0; i < archCount; i++) {
                     raf.seek(8L + i * 20L);
                     int cpuType = reverseByteOrder ? Integer.reverseBytes(raf.readInt()) : raf.readInt();
@@ -128,6 +143,7 @@ public class Macho {
                     long offset = reverseByteOrder ? Integer.reverseBytes(raf.readInt()) : raf.readInt();
                     long size = reverseByteOrder ? Integer.reverseBytes(raf.readInt()) : raf.readInt();
 
+                    LOGGER.info("[MACHO] Arch[" + i + "]: " + getArchitectureName(cpuType) + " cpuType=0x" + Integer.toHexString(cpuType) + " subType=" + cpuSubType + " offset=" + offset + " size=" + (size / 1024 / 1024) + "MB");
                     cpuTypes.add(cpuType);
                     cpuSubTypes.add(cpuSubType);
                     offsets.add(offset);
@@ -135,33 +151,153 @@ public class Macho {
                 }
             } else {
                 this.isUniversal = false;
-                LOGGER.info("This is not a Universal binary.");
+                LOGGER.info("[MACHO] Single architecture binary (magic=0x" + Integer.toHexString(magic) + ")");
             }
 
-            // After processing the Mach-O headers, check for Swift
+            // After processing the Mach-O headers, check for Swift and encryption
             detectSwift(file);
+            detectEncryption(file);
         } catch (IOException e) {
-            LOGGER.log(Level.SEVERE, "Error reading file", e);
+            LOGGER.log(Level.SEVERE, "[MACHO] Error reading file: " + file.getAbsolutePath(), e);
         }
     }
 
     private void detectSwift(File file) {
+        long fileSize = file.length();
+        LOGGER.info("[DETECT-SWIFT] Starting Swift detection for: " + file.getName() + " (size: " + (fileSize / 1024 / 1024) + " MB)");
         try {
-            // Read the file content as bytes
-            byte[] content = Files.readAllBytes(file.toPath());
-            String stringContent = new String(content, StandardCharsets.UTF_8);
+            // For large binaries, read in chunks to avoid OOM
+            // Instead of loading entire file into memory as String
+            byte[] searchPatterns = {
+                // We'll search for patterns in chunks
+            };
 
-            // Look for common Swift indicators in the binary
-            isSwift = stringContent.contains("Swift Runtime") || 
-                      stringContent.contains("SwiftCore") ||
-                      stringContent.contains("_swift_") ||
-                      stringContent.contains("_$s");  // Swift name mangling prefix
+            boolean foundSwiftRuntime = false;
+            boolean foundSwiftCore = false;
+            boolean foundSwiftUnderscore = false;
+            boolean foundSwiftMangling = false;
 
-            LOGGER.info("Binary detected as: " + (isSwift ? "Swift" : "Objective-C"));
+            int chunkSize = 8 * 1024 * 1024; // 8MB chunks
+            byte[] buffer = new byte[chunkSize + 256]; // extra overlap for boundary matching
+            int overlap = 256; // overlap to catch patterns split across chunks
+
+            try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+                long position = 0;
+                int carryOver = 0;
+
+                while (position < fileSize) {
+                    int readOffset = 0;
+                    if (carryOver > 0) {
+                        // Copy overlap from end of previous chunk
+                        readOffset = carryOver;
+                    }
+
+                    raf.seek(position);
+                    int bytesRead = raf.read(buffer, readOffset, chunkSize);
+                    if (bytesRead <= 0) break;
+
+                    int totalBytes = readOffset + bytesRead;
+                    String chunk = new String(buffer, 0, totalBytes, StandardCharsets.UTF_8);
+
+                    if (!foundSwiftRuntime && chunk.contains("Swift Runtime")) foundSwiftRuntime = true;
+                    if (!foundSwiftCore && chunk.contains("SwiftCore")) foundSwiftCore = true;
+                    if (!foundSwiftUnderscore && chunk.contains("_swift_")) foundSwiftUnderscore = true;
+                    if (!foundSwiftMangling && chunk.contains("_$s")) foundSwiftMangling = true;
+
+                    // Early exit if we found any indicator
+                    if (foundSwiftRuntime || foundSwiftCore || foundSwiftUnderscore || foundSwiftMangling) {
+                        LOGGER.info("[DETECT-SWIFT] Found Swift indicator early at position ~" + position);
+                        break;
+                    }
+
+                    position += bytesRead;
+                    // Keep overlap bytes for next iteration
+                    if (bytesRead == chunkSize) {
+                        System.arraycopy(buffer, totalBytes - overlap, buffer, 0, overlap);
+                        carryOver = overlap;
+                    }
+                }
+            }
+
+            isSwift = foundSwiftRuntime || foundSwiftCore || foundSwiftUnderscore || foundSwiftMangling;
+            LOGGER.info("[DETECT-SWIFT] Result: " + (isSwift ? "Swift" : "Objective-C") +
+                " (Runtime=" + foundSwiftRuntime + ", Core=" + foundSwiftCore +
+                ", _swift_=" + foundSwiftUnderscore + ", _$s=" + foundSwiftMangling + ")");
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Error detecting Swift/Objective-C", e);
-            isSwift = false; // Default to Objective-C if detection fails
+            LOGGER.log(Level.WARNING, "[DETECT-SWIFT] Error detecting Swift/Objective-C", e);
+            isSwift = false;
         }
+    }
+
+    private void detectEncryption(File file) {
+        LOGGER.info("[DETECT-ENCRYPT] Checking FairPlay DRM encryption for: " + file.getName());
+        try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
+            int magic = raf.readInt();
+
+            boolean is64bit;
+            boolean littleEndian;
+
+            if (magic == MH_MAGIC)         { is64bit = false; littleEndian = false; }
+            else if (magic == MH_CIGAM)    { is64bit = false; littleEndian = true;  }
+            else if (magic == MH_MAGIC_64) { is64bit = true;  littleEndian = false; }
+            else if (magic == MH_CIGAM_64) { is64bit = true;  littleEndian = true;  }
+            else {
+                LOGGER.info("[DETECT-ENCRYPT] Not a single-arch Mach-O (magic=0x" + Integer.toHexString(magic) + "), skipping encryption check");
+                return;
+            }
+
+            int headerSize = is64bit ? 32 : 28;
+
+            // Read ncmds at offset 16
+            raf.seek(16);
+            int ncmds = readMachoInt(raf, littleEndian);
+
+            // Skip to end of header where load commands begin
+            raf.seek(headerSize);
+
+            for (int i = 0; i < ncmds; i++) {
+                long cmdOffset = raf.getFilePointer();
+                int cmd = readMachoInt(raf, littleEndian);
+                int cmdsize = readMachoInt(raf, littleEndian);
+
+                if (cmd == LC_ENCRYPTION_INFO || cmd == LC_ENCRYPTION_INFO_64) {
+                    this.cryptoff = readMachoInt(raf, littleEndian);
+                    this.cryptsize = readMachoInt(raf, littleEndian);
+                    int cryptid = readMachoInt(raf, littleEndian);
+
+                    this.isEncrypted = (cryptid != 0);
+                    LOGGER.info("[DETECT-ENCRYPT] LC_ENCRYPTION_INFO found: cryptid=" + cryptid
+                        + " cryptoff=0x" + Integer.toHexString(this.cryptoff)
+                        + " cryptsize=" + (this.cryptsize / 1024 / 1024) + "MB");
+
+                    if (this.isEncrypted) {
+                        LOGGER.warning("[DETECT-ENCRYPT] *** BINARY IS FAIRPLAY DRM ENCRYPTED (cryptid=" + cryptid + ") ***");
+                        LOGGER.warning("[DETECT-ENCRYPT] Decompilation will produce mostly halt_baddata() stubs.");
+                        LOGGER.warning("[DETECT-ENCRYPT] Use a decrypted IPA for meaningful analysis.");
+                    } else {
+                        LOGGER.info("[DETECT-ENCRYPT] Binary is NOT encrypted (cryptid=0, previously decrypted)");
+                    }
+                    return;
+                }
+
+                // Advance to next load command
+                if (cmdsize <= 0) {
+                    LOGGER.warning("[DETECT-ENCRYPT] Invalid load command size at offset " + cmdOffset);
+                    break;
+                }
+                raf.seek(cmdOffset + cmdsize);
+            }
+
+            LOGGER.info("[DETECT-ENCRYPT] No LC_ENCRYPTION_INFO found - binary is not encrypted");
+
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "[DETECT-ENCRYPT] Error checking encryption", e);
+        }
+    }
+
+    private static int readMachoInt(RandomAccessFile raf, boolean littleEndian) throws IOException {
+        int value = raf.readInt();
+        return littleEndian ? Integer.reverseBytes(value) : value;
     }
 
     public static class Architecture {
@@ -261,6 +397,24 @@ public class Macho {
         return isSwift;
     }
 
+    public boolean isEncrypted() {
+        return isEncrypted;
+    }
+
+    public int getCryptoff() {
+        return cryptoff;
+    }
+
+    public int getCryptsize() {
+        return cryptsize;
+    }
+
+    public String getEncryptionSummary() {
+        if (!isEncrypted) return "Not encrypted";
+        return String.format("FairPlay DRM encrypted (offset=0x%X, size=%dMB)",
+            cryptoff, cryptsize / 1024 / 1024);
+    }
+
     public long getSize() {
         File machoFile = new File(this.machoExecutablePath);
         return machoFile.length();
@@ -276,6 +430,7 @@ public class Macho {
         this.outputDirectoryPath = "";
         this.machoExecutableName = "unknown";
         this.isSwift = false;
+        this.isEncrypted = false;
     }
 
     public static Macho createEmpty() {
